@@ -488,10 +488,19 @@ func (c *Consumer) deliver(
 		if err != nil {
 			return fmt.Errorf("deadletter after delivery limit: %w", err)
 		}
+
+		return nil
 	}
 
+	var de *DeadletterError
+
 	err := c.handler(subCtx, delivery)
-	if err != nil {
+	if errors.As(err, &de) {
+		err := c.deadletterDelivery(ctx, delivery)
+		if err != nil {
+			return fmt.Errorf("deadletter after DeadletterError: %w", err)
+		}
+	} else if err != nil {
 		return err
 	}
 

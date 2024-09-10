@@ -84,3 +84,13 @@ func tErrorf(code TransitionCode, format string, a ...any) *transitionError {
 		msg:   err.Error(),
 	}
 }
+
+func NewDeadletterError() error {
+	return &DeadletterError{}
+}
+
+type DeadletterError struct{}
+
+func (he *DeadletterError) Error() string {
+	return "deadletter message"
+}
