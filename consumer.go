@@ -523,6 +523,26 @@ func (c *Consumer) deadletterDelivery(
 		newHead[k] = v
 	}
 
+	// If a delivery is immediately deadlettered on first delivery
+	// by using NewDeadletterError(), replicate the header structure
+	// that rabbit uses when deadlettering.
+	_, exists := newHead["old-death"]
+	if !exists {
+		newHead["old-death"] = []amqp.Table{
+			{
+				"count":        1,
+				"exchange":     c.exchangeName,
+				"queue":        c.queueName,
+				"reason":       "rejected",
+				"routing-keys": []string{delivery.RoutingKey},
+				"time":         time.Now(),
+			},
+		}
+		newHead["x-first-death-exchange"] = c.exchangeName
+		newHead["x-first-death-queue"] = c.queueName
+		newHead["x-first-death-reason"] = "rejected"
+	}
+
 	err := c.ch.PublishWithContext(ctx, c.deadExchangeName, routeFail,
 		false, false, amqp.Publishing{
 			Headers:         newHead,
