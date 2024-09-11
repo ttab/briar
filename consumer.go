@@ -534,7 +534,7 @@ func (c *Consumer) deadletterDelivery(
 				"exchange":     c.exchangeName,
 				"queue":        c.queueName,
 				"reason":       "rejected",
-				"routing-keys": []string{delivery.RoutingKey},
+				"routing-keys": []interface{}{delivery.RoutingKey},
 				"time":         time.Now(),
 			},
 		}
