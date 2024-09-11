@@ -528,8 +528,8 @@ func (c *Consumer) deadletterDelivery(
 	// that rabbit uses when deadlettering.
 	_, exists := newHead["old-death"]
 	if !exists {
-		newHead["old-death"] = []amqp.Table{
-			{
+		newHead["old-death"] = []interface{}{
+			amqp.Table{
 				"count":        1,
 				"exchange":     c.exchangeName,
 				"queue":        c.queueName,
