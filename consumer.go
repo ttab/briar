@@ -483,7 +483,7 @@ func (c *Consumer) deliver(
 		}
 	}()
 
-	if getDeathCount(delivery.Headers, c.queueName) > c.opts.DeliveryLimit {
+	if getDeathCount(delivery.Headers, c.queueName) >= c.opts.DeliveryLimit {
 		err := c.deadletterDelivery(ctx, delivery)
 		if err != nil {
 			return fmt.Errorf("deadletter after delivery limit: %w", err)
