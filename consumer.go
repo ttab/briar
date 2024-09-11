@@ -762,3 +762,59 @@ func firstNonZeroDuration(values ...time.Duration) time.Duration {
 
 	return 0
 }
+
+// GetRoutingKey searches for the original routing key in headers or
+// returns the passed routingKey if it's recognized as original.
+func GetRoutingKey(routingKey string, headers amqp.Table, queueName string) (string, error) {
+	// routingKey is equal to queueName when msgs are manually shoveled from deadletter queue
+	// via rabbit ui shoveler interface.
+	if routingKey != "do-retry" && routingKey != queueName && routingKey != "" {
+		return routingKey, nil
+	}
+
+	searchInDeathField := func(field string) (string, error) {
+		deaths, ok := headers[field].([]interface{})
+		if !ok || len(deaths) == 0 {
+			return "", fmt.Errorf("missing %q field or has unexpected type or is empty", field)
+		}
+
+		for i := range deaths {
+			death, ok := deaths[i].(amqp.Table)
+			if !ok {
+				continue
+			}
+
+			qn, ok := death["queue"].(string)
+			if !ok || qn != queueName {
+				continue
+			}
+
+			rKeys, ok := death["routing-keys"].([]interface{})
+			if !ok || len(rKeys) == 0 {
+				return "", fmt.Errorf("missing routing key for queue %q in %q field", queueName, field)
+			}
+
+			rk, ok := rKeys[0].(string)
+			if !ok {
+				return "", fmt.Errorf(
+					"expected routing key of type string at position 0 for queue %q in %q field", queueName, field)
+			}
+
+			return rk, nil
+		}
+
+		return "", fmt.Errorf("no matching queue found for %q queue in %q field", queueName, field)
+	}
+
+	routingKey, xErr := searchInDeathField("x-death")
+	if xErr == nil {
+		return routingKey, nil
+	}
+
+	routingKey, oErr := searchInDeathField("old-death")
+	if oErr == nil {
+		return routingKey, nil
+	}
+
+	return "", fmt.Errorf("routing key not found: %w", errors.Join(xErr, oErr))
+}
