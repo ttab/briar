@@ -27,6 +27,7 @@ type T interface {
 	Helper()
 	Fatalf(format string, args ...any)
 	Cleanup(func())
+	Log(args ...any)
 }
 
 func SetUpBackingServices(
@@ -46,6 +47,8 @@ func SetUpBackingServices(
 
 		err := PurgeBackingServices()
 		Must(t, err, "purge backing services")
+
+		t.Log("removed test containers")
 	})
 
 	env := Environment{

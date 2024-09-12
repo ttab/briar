@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -46,8 +48,10 @@ func ExampleConsumer() {
 	}
 }
 
+const testDeliveryLimit = 5
+
 func TestConsumer(t *testing.T) {
-	t.Parallel()
+	fixedSeed := os.Getenv("FIXED_SEED") == "true"
 
 	ctx, cancel := context.WithCancel(itest.Context(t))
 	defer cancel()
@@ -67,9 +71,7 @@ func TestConsumer(t *testing.T) {
 		Level: slog.LevelDebug,
 	}))
 
-	targetCount := 20
-	handleN := targetCount
-	deliveryLimit := 2
+	targetCount := 40
 	routingKeys := []string{"rA", "rB"}
 	prepChan := make(chan producedSpec)
 
@@ -77,16 +79,34 @@ func TestConsumer(t *testing.T) {
 
 	state := make(map[string]*recieverState)
 
-	go dummyProducer(t, conn, exName, targetCount, routingKeys, prepChan)
+	var r *rand.Rand
+
+	if fixedSeed {
+		r = rand.New(rand.NewPCG(42, 42))
+	} else {
+		t := time.Now()
+		r = rand.New(rand.NewPCG(uint64(t.UnixMicro()), uint64(t.UnixMilli())))
+	}
+
+	go dummyProducer(t, r, conn, exName, targetCount, routingKeys, prepChan)
+
+	var handleN int
 
 	go func() {
 		for expect := range prepChan {
-			println("got spec")
-
 			m.Lock()
 
-			handleN += min(expect.FailN, deliveryLimit)
+			handleN += min(expect.FailN, testDeliveryLimit)
 			handleN += expect.RequeueN
+
+			if expect.Deadletter {
+				handleN++
+			}
+
+			if !expect.Deadletter && expect.FailN < testDeliveryLimit {
+				// Count the final ack
+				handleN++
+			}
 
 			state[expect.Key] = &recieverState{
 				Spec: expect,
@@ -105,28 +125,29 @@ func TestConsumer(t *testing.T) {
 		logger.With("component", "consumer"),
 		bs.RabbitURI,
 		briar.ConsumerOptions{
-			ExchangeName:  exName,
-			QueueName:     qName,
-			DeliveryLimit: int64(deliveryLimit),
+			ExchangeName:      exName,
+			QueueName:         qName,
+			DeliveryLimit:     testDeliveryLimit,
+			RetryHandlingWait: 1 * time.Millisecond,
 			OnError: func(code briar.TransitionCode, count int, err error) {
 				println(code, count, err.Error())
 			},
 		},
 		briar.AckHandler(func(
 			ctx context.Context, delivery amqp.Delivery,
-		) (briar.Action, error) {
+		) (act briar.Action, _ error) {
 			handled++
 
 			// Stop the consumer when we have handled the expected
 			// number of messages.
 			if handled == handleN {
-				defer cancelConsumer()
+				defer func() {
+					// Allow some time to detect if we fetch
+					// more than expected.
+					time.Sleep(1 * time.Second)
+					cancelConsumer()
+				}()
 			}
-
-			println("id", delivery.MessageId)
-			enc := json.NewEncoder(os.Stderr)
-			enc.SetIndent("", "  ")
-			enc.Encode(delivery.Headers)
 
 			var spec producedSpec
 
@@ -137,43 +158,100 @@ func TestConsumer(t *testing.T) {
 			}
 
 			m.Lock()
-			st := state[spec.Key]
-			m.Unlock()
+			st, ok := state[spec.Key]
 
-			println("has state", st.Spec.Key)
+			defer func() {
+				state[spec.Key] = st
+				m.Unlock()
+			}()
 
-			if spec.Deadletter {
-				st.DeadletteredN++
+			if !ok {
+				t.Errorf("got unknown message %q", delivery.MessageId)
 
 				return briar.ManualAck, briar.NewDeadletterError()
 			}
 
-			if spec.FailN > st.FailedN {
+			switch {
+			case spec.Deadletter:
+				st.DeadletteredN++
+
+				return briar.ManualAck, briar.NewDeadletterError()
+			case spec.FailN > st.FailedN:
 				st.FailedN++
 
 				return briar.NackDiscard, nil
-			}
-
-			if spec.RequeueN > st.RequeuedN {
+			case spec.RequeueN > st.RequeuedN:
 				st.RequeuedN++
 
 				return briar.NackRequeue, nil
+			default:
+				st.AckedN++
+
+				return briar.Ack, nil
 			}
-
-			st.AckedN++
-
-			return briar.Ack, nil
 		}))
 
 	err = consumer.Run(consumerCtx)
 	itest.Must(t, err, "run consumer")
 
+	if handled != handleN {
+		t.Errorf("unexpected recieve count: got %d, expected %d",
+			handled, handleN)
+	}
+
 	for k, s := range state {
-		fmt.Printf("%s a: %02d f: %02d (%02d) r: %02d (%02d) d: %02d\n",
+		t.Run(k, func(t *testing.T) {
+			if s.AckedN > 1 {
+				t.Fatal("acked more than once")
+			}
+
+			expectAck := 1
+			expectFails := min(testDeliveryLimit, s.Spec.FailN)
+			expectRequeue := s.Spec.RequeueN
+
+			var expectDeadletter int
+
+			if s.Spec.Deadletter {
+				expectDeadletter = 1
+				expectAck = 0
+				expectFails = 0
+				expectRequeue = 0
+			}
+
+			if s.Spec.FailN >= testDeliveryLimit {
+				expectAck = 0
+			}
+
+			if s.AckedN != expectAck {
+				t.Fatalf("expected %d acks, got %d",
+					expectAck, s.AckedN)
+			}
+
+			if s.FailedN != expectFails {
+				t.Fatalf("expected %d failures, got %d",
+					expectFails, s.FailedN)
+			}
+
+			if s.RequeuedN != expectRequeue {
+				t.Fatalf("expected %d requeues, got %d",
+					expectRequeue, s.RequeuedN)
+			}
+
+			if s.DeadletteredN != expectDeadletter {
+				t.Fatalf("expected %d deadlettering, got %d",
+					expectDeadletter, s.DeadletteredN)
+			}
+		})
+	}
+
+	for _, k := range slices.Sorted(maps.Keys(state)) {
+		s := state[k]
+
+		fmt.Printf("%s a: %02d f: %02d (%02d) r: %02d (%02d) d: %02d (%v)\n",
 			k, s.AckedN,
 			s.FailedN, s.Spec.FailN,
 			s.RequeuedN, s.Spec.RequeueN,
-			s.DeadletteredN)
+			s.DeadletteredN, s.Spec.Deadletter)
 	}
 }
 
@@ -183,6 +261,20 @@ type recieverState struct {
 	FailedN       int
 	RequeuedN     int
 	DeadletteredN int
+}
+
+func (rs *recieverState) check(t *testing.T, ack, fail, req, dead int) {
+	t.Helper()
+
+	if rs.AckedN != ack {
+		t.Errorf("expected %q to be acked %d times, got %d",
+			rs.Spec.Key, ack, rs.AckedN)
+	}
+
+	if rs.AckedN != ack {
+		t.Errorf("expected %q to be acked %d times, got %d",
+			rs.Spec.Key, ack, rs.AckedN)
+	}
 }
 
 type producedSpec struct {
@@ -195,7 +287,7 @@ type producedSpec struct {
 }
 
 func dummyProducer(
-	t *testing.T, conn *amqp.Connection, ex string,
+	t *testing.T, r *rand.Rand, conn *amqp.Connection, ex string,
 	tCount int, rKeys []string, prep chan producedSpec,
 ) {
 	t.Helper()
@@ -218,16 +310,16 @@ func dummyProducer(
 			Headers:    make(amqp.Table),
 		}
 
-		switch rand.IntN(3) {
+		switch r.IntN(3) {
 		case 0:
-			spec.FailN = sent % 4
+			spec.FailN = sent % 7
 		case 1:
-			spec.RequeueN = sent % 5
+			spec.RequeueN = sent % 7
 		case 2:
 			spec.Deadletter = true
 		}
 
-		spec.Headers["dummy-value"] = rand.Int()
+		spec.Headers["dummy-value"] = r.Int()
 
 		payload, err := json.Marshal(spec)
 		itest.Must(t, err, "marshal message spec payload")
@@ -245,8 +337,6 @@ func dummyProducer(
 			AppId:        "test-producer",
 		})
 		itest.Must(t, err, "publish test message")
-
-		println("sent", rKey, spec.Key)
 
 		sent++
 	}

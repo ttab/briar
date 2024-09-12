@@ -91,6 +91,21 @@ const (
 	ManualAck
 )
 
+func (a Action) String() string {
+	switch a {
+	case Ack:
+		return "Ack"
+	case NackDiscard:
+		return "NackDiscard"
+	case NackRequeue:
+		return "NackRequeue"
+	case ManualAck:
+		return "ManualAck"
+	}
+
+	return ""
+}
+
 // AckHandler is a convenience wrapper that allows the handler to return the
 // Ack/Nack action as a value. Returning an error will cause the channel to be
 // closed and re-opened. Return a HaltError to stop the consumer.
@@ -99,6 +114,11 @@ func AckHandler(
 ) HandlerFunc {
 	return func(ctx context.Context, delivery amqp.Delivery) error {
 		action, innerErr := fn(ctx, delivery)
+		if errors.Is(innerErr, &DeadletterError{}) {
+			// Immediately short-circuit it we're being asked to
+			// deadletter.
+			return innerErr
+		}
 
 		switch action {
 		case Ack:
@@ -483,7 +503,9 @@ func (c *Consumer) deliver(
 		}
 	}()
 
-	if getDeathCount(delivery.Headers, c.queueName) >= c.opts.DeliveryLimit {
+	deaths := getDeathCount(delivery.Headers, c.queueName)
+	if deaths >= c.opts.DeliveryLimit {
+		println(delivery.MessageId, "death count", deaths, "of", c.opts.DeliveryLimit, ": deadlettering")
 		err := c.deadletterDelivery(ctx, delivery)
 		if err != nil {
 			return fmt.Errorf("deadletter after delivery limit: %w", err)
@@ -492,10 +514,8 @@ func (c *Consumer) deliver(
 		return nil
 	}
 
-	var de *DeadletterError
-
 	err := c.handler(subCtx, delivery)
-	if errors.As(err, &de) {
+	if errors.Is(err, &DeadletterError{}) {
 		err := c.deadletterDelivery(ctx, delivery)
 		if err != nil {
 			return fmt.Errorf("deadletter after DeadletterError: %w", err)
