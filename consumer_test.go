@@ -263,20 +263,6 @@ type recieverState struct {
 	DeadletteredN int
 }
 
-func (rs *recieverState) check(t *testing.T, ack, fail, req, dead int) {
-	t.Helper()
-
-	if rs.AckedN != ack {
-		t.Errorf("expected %q to be acked %d times, got %d",
-			rs.Spec.Key, ack, rs.AckedN)
-	}
-
-	if rs.AckedN != ack {
-		t.Errorf("expected %q to be acked %d times, got %d",
-			rs.Spec.Key, ack, rs.AckedN)
-	}
-}
-
 type producedSpec struct {
 	Key        string
 	FailN      int
