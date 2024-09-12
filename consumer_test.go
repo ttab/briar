@@ -128,9 +128,10 @@ func TestConsumer(t *testing.T) {
 			ExchangeName:      exName,
 			QueueName:         qName,
 			DeliveryLimit:     testDeliveryLimit,
+			RoutingKeys:       routingKeys,
 			RetryHandlingWait: 1 * time.Millisecond,
 			OnError: func(code briar.TransitionCode, count int, err error) {
-				println(code, count, err.Error())
+				t.Errorf("consumer error %s: %v", code, err)
 			},
 		},
 		briar.AckHandler(func(
