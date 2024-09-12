@@ -91,6 +91,21 @@ const (
 	ManualAck
 )
 
+func (a Action) String() string {
+	switch a {
+	case Ack:
+		return "Ack"
+	case NackDiscard:
+		return "NackDiscard"
+	case NackRequeue:
+		return "NackRequeue"
+	case ManualAck:
+		return "ManualAck"
+	}
+
+	return ""
+}
+
 // AckHandler is a convenience wrapper that allows the handler to return the
 // Ack/Nack action as a value. Returning an error will cause the channel to be
 // closed and re-opened. Return a HaltError to stop the consumer.
@@ -99,6 +114,11 @@ func AckHandler(
 ) HandlerFunc {
 	return func(ctx context.Context, delivery amqp.Delivery) error {
 		action, innerErr := fn(ctx, delivery)
+		if errors.Is(innerErr, &DeadletterError{}) {
+			// Immediately short-circuit it we're being asked to
+			// deadletter.
+			return innerErr
+		}
 
 		switch action {
 		case Ack:
@@ -483,15 +503,24 @@ func (c *Consumer) deliver(
 		}
 	}()
 
-	if getDeathCount(delivery.Headers, c.queueName) > c.opts.DeliveryLimit {
+	deaths := getDeathCount(delivery.Headers, c.queueName)
+	if deaths >= c.opts.DeliveryLimit {
+		println(delivery.MessageId, "death count", deaths, "of", c.opts.DeliveryLimit, ": deadlettering")
 		err := c.deadletterDelivery(ctx, delivery)
 		if err != nil {
 			return fmt.Errorf("deadletter after delivery limit: %w", err)
 		}
+
+		return nil
 	}
 
 	err := c.handler(subCtx, delivery)
-	if err != nil {
+	if errors.Is(err, &DeadletterError{}) {
+		err := c.deadletterDelivery(ctx, delivery)
+		if err != nil {
+			return fmt.Errorf("deadletter after DeadletterError: %w", err)
+		}
+	} else if err != nil {
 		return err
 	}
 
@@ -512,6 +541,26 @@ func (c *Consumer) deadletterDelivery(
 		}
 
 		newHead[k] = v
+	}
+
+	// If a delivery is immediately deadlettered on first delivery
+	// by using NewDeadletterError(), replicate the header structure
+	// that rabbit uses when deadlettering.
+	_, exists := newHead["old-death"]
+	if !exists {
+		newHead["old-death"] = []interface{}{
+			amqp.Table{
+				"count":        1,
+				"exchange":     c.exchangeName,
+				"queue":        c.queueName,
+				"reason":       "rejected",
+				"routing-keys": []interface{}{delivery.RoutingKey},
+				"time":         time.Now(),
+			},
+		}
+		newHead["x-first-death-exchange"] = c.exchangeName
+		newHead["x-first-death-queue"] = c.queueName
+		newHead["x-first-death-reason"] = "rejected"
 	}
 
 	err := c.ch.PublishWithContext(ctx, c.deadExchangeName, routeFail,
@@ -732,4 +781,60 @@ func firstNonZeroDuration(values ...time.Duration) time.Duration {
 	}
 
 	return 0
+}
+
+// GetRoutingKey searches for the original routing key in headers or
+// returns the passed routingKey if it's recognized as original.
+func GetRoutingKey(routingKey string, headers amqp.Table, queueName string) (string, error) {
+	// routingKey is equal to queueName when msgs are manually shoveled from deadletter queue
+	// via rabbit ui shoveler interface.
+	if routingKey != "do-retry" && routingKey != queueName && routingKey != "" {
+		return routingKey, nil
+	}
+
+	searchInDeathField := func(field string) (string, error) {
+		deaths, ok := headers[field].([]interface{})
+		if !ok || len(deaths) == 0 {
+			return "", fmt.Errorf("missing %q field or has unexpected type or is empty", field)
+		}
+
+		for i := range deaths {
+			death, ok := deaths[i].(amqp.Table)
+			if !ok {
+				continue
+			}
+
+			qn, ok := death["queue"].(string)
+			if !ok || qn != queueName {
+				continue
+			}
+
+			rKeys, ok := death["routing-keys"].([]interface{})
+			if !ok || len(rKeys) == 0 {
+				return "", fmt.Errorf("missing routing key for queue %q in %q field", queueName, field)
+			}
+
+			rk, ok := rKeys[0].(string)
+			if !ok {
+				return "", fmt.Errorf(
+					"expected routing key of type string at position 0 for queue %q in %q field", queueName, field)
+			}
+
+			return rk, nil
+		}
+
+		return "", fmt.Errorf("no matching queue found for %q queue in %q field", queueName, field)
+	}
+
+	routingKey, xErr := searchInDeathField("x-death")
+	if xErr == nil {
+		return routingKey, nil
+	}
+
+	routingKey, oErr := searchInDeathField("old-death")
+	if oErr == nil {
+		return routingKey, nil
+	}
+
+	return "", fmt.Errorf("routing key not found: %w", errors.Join(xErr, oErr))
 }
